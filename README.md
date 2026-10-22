@@ -249,6 +249,42 @@ machine.
 backticks, quotes, and anything over a few hundred characters. Write the body to
 a file, pass the path.
 
+### Queue first, send second
+
+`send` **queues the body before it dials**. The body lands in `state/outbox/`
+durably, the dial happens, and the item is deleted only when the peer answers
+`{"ok": true}`. A dial that fails leaves the letter queued with its attempt count
+and the peer's own error words, exits `2`, and waits for a flusher.
+
+This order is the whole point. The earlier code wrote an *intent* row into
+`state/sent/` and dialled, and nothing retained the body as work to do — so a send
+that died mid-dial left a row saying `pending` and a body only the model still
+remembered. On 2026-10-20 two letters sat that way for an hour and a human read
+the rows as receipts, because `pending` looks like a state rather than a corpse.
+
+```bash
+inbox outbox list      # what is waiting, how old, how many attempts, why
+inbox outbox flush     # try each; exit 0 when the queue is empty, 2 while items remain
+inbox recover          # requeue bodies stranded by the old path (one-way, additive)
+```
+
+`setup.sh` installs a flusher (`com.toragents.outbox` / `toragents-outbox.service`)
+that runs `outbox flush` in a loop, because a queue with no process draining it
+is just a slower way to lose a letter.
+
+**At-least-once, stated rather than hidden.** A flusher killed mid-dial cannot
+tell "the peer never heard me" from "the peer accepted it and my process died",
+so the item is marked `AMBIGUOUS` and is **not** retried without
+`--retry-ambiguous`. That is the one place a duplicate is possible, and the tool
+says so instead of pretending otherwise.
+
+`--direct` dials without queueing. It exists so the flusher drains an item without
+enqueueing a second copy of it, and it is also the at-most-once escape hatch.
+
+The queue format is the one `tools/outbox.py` already used, so either tool can
+drain the same queue — and `tools/test_durable_send.py` asserts exactly that,
+because a shared format nobody checks is two formats.
+
 ## Commands
 
 | command | what it does |
@@ -264,6 +300,8 @@ a file, pass the path.
 | `inbox doctor` | is the receiving half wired up on this machine |
 | `inbox reach --to <label>` | measure whether they are reachable right now |
 | `inbox sent list\|verify\|show <id>` | your own outbound, held whole, with hashes |
+| `inbox outbox list\|flush` | what is queued to send, and drain it (0 empty, 2 items remain) |
+| `inbox recover` | requeue bodies stranded by the pre-outbox send path |
 | `inbox dg show` | delivery provenance per message, with staleness named |
 | `inbox chat --follow` | full-width transcript in a terminal pane |
 
@@ -493,6 +531,7 @@ subject is cut out of the preview so the preview is text you have not read yet.
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_durable_send.py # queue-first send, flush, recover, shared queue format
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail

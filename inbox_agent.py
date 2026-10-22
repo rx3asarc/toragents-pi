@@ -29,6 +29,7 @@ from pathlib import Path
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import socket
@@ -769,6 +770,230 @@ def sent_confirm(rec, reply):
     return rec
 
 
+# ------------------------------------------------------------- the outbox --
+#
+# The sent store records INTENT, which is a receipt for the sender's own memory:
+# it proves a body was about to go out. It does not survive as work to do. A send
+# that dies between the intent write and the reply leaves a row saying `pending`
+# and a body nothing will ever retry -- which happened on this project on
+# 2026-10-20, twice in one night, and the rows were read by a human as receipts
+# because `pending` looks like a state and not like a corpse.
+#
+# So: queue first, send second. The body lands in state/outbox/ durably, is
+# dialled, and is deleted ONLY on a peer's ok:true. A failed dial leaves it
+# queued with its attempt count and the peer's own error words. `outbox flush`
+# drains it, and because the format is the same one tools/outbox.py already
+# writes, either tool can drain the same queue.
+#
+# At-least-once, stated rather than hidden: a flusher killed mid-dial cannot tell
+# "never heard" from "accepted and my process died", so it marks the item
+# AMBIGUOUS and refuses to retry it without an explicit flag. A duplicate is
+# possible there and only there.
+
+OUTBOX = os.path.join(STATE, "outbox")
+OUTBOX_CLAIMS = os.path.join(OUTBOX, ".claims")
+OUTBOX_TMP = os.path.join(OUTBOX, ".tmp")
+OUTBOX_CLAIM_STALE_S = 300.0
+
+
+def outbox_ensure():
+    for d in (OUTBOX, OUTBOX_CLAIMS, OUTBOX_TMP):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    return OUTBOX
+
+
+def outbox_items():
+    """Pending items, oldest first. The name is <ts_ms>-<sha8>.json, so sorting by
+    name is sorting by arrival -- and a clock that jumps backwards cannot reorder
+    a queue that is already named."""
+    try:
+        names = sorted(n for n in os.listdir(OUTBOX) if n.endswith(".json"))
+    except FileNotFoundError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(OUTBOX, n)
+        try:
+            with open(p) as f:
+                out.append((p, json.load(f)))
+        except (OSError, ValueError):
+            out.append((p, None))          # corrupt: report, never silently drop
+    return out
+
+
+def _atomic_json(path, obj):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def outbox_queue(to_label, body, onion=""):
+    """Queue a body durably. Returns the path, or an existing path if this exact
+    body is already pending for this peer (queueing twice is not sending twice)."""
+    outbox_ensure()
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    for path, it in outbox_items():
+        if isinstance(it, dict) and it.get("sha256") == digest and it.get("to") == to_label:
+            return path
+    base = f"{int(time.time() * 1000)}-{digest[:8]}"
+    path = os.path.join(OUTBOX, base + ".json")
+    n = 1
+    while os.path.exists(path):                 # two bodies can share a millisecond
+        path = os.path.join(OUTBOX, f"{base}-{n}.json")
+        n += 1
+    _atomic_json(path, {"to": to_label or "", "onion": onion or "", "body": body,
+                        "sha256": digest, "created": time.time(), "attempts": 0,
+                        "last_error": None, "last_attempt": None,
+                        "ambiguous": False, "sent_id": None})
+    return path
+
+
+def outbox_remove(path):
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def outbox_note_failure(path, error):
+    """Record why an item is still waiting, on the item itself.
+
+    A queue that only says 'pending' sends the next reader back to the logs to
+    reconstruct what already happened -- which is the exact hour this feature was
+    built to stop spending. The peer's own words go here, not a category.
+    """
+    if not path:
+        return
+    try:
+        with open(path) as f:
+            it = json.load(f)
+    except (OSError, ValueError):
+        return
+    it["attempts"] = int(it.get("attempts") or 0) + 1
+    it["last_attempt"] = time.time()
+    it["last_error"] = str(error)[:500]
+    try:
+        _atomic_json(path, it)
+    except OSError:
+        pass
+
+
+def _outbox_claim(path):
+    """O_EXCL is the only primitive that makes 'I own this' atomic across
+    processes; a lock file we then delete is not a lock. A claim older than the
+    stale window belonged to a flusher that died holding it, and is taken over --
+    which is the one place a duplicate send becomes possible."""
+    outbox_ensure()
+    cpath = os.path.join(OUTBOX_CLAIMS, os.path.basename(path) + ".claim")
+    payload = json.dumps({"pid": os.getpid(), "at": time.time()}).encode()
+    for attempt in (0, 1):
+        try:
+            fd = os.open(cpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            return cpath
+        except FileExistsError:
+            if attempt:
+                return None
+            try:
+                age = time.time() - os.path.getmtime(cpath)
+            except OSError:
+                age = 0.0
+            if age < OUTBOX_CLAIM_STALE_S:
+                return None
+            try:
+                os.replace(cpath, cpath + f".stale.{int(time.time())}")
+            except OSError:
+                return None
+    return None
+
+
+def _outbox_release(cpath):
+    if cpath:
+        try:
+            os.unlink(cpath)
+        except OSError:
+            pass
+
+
+OUTBOX_ITEM_TIMEOUT_S = 420.0
+
+
+def _send_command():
+    """The command the flusher re-enters to dial. Overridable so a test can drive
+    the queue without tor -- the same escape hatch tools/outbox.py has, so the two
+    drainers stay swappable."""
+    env = os.environ.get("TORAGENTS_SEND_CMD")
+    if env:
+        return shlex.split(env)
+    return [sys.executable, os.path.abspath(__file__), "send"]
+
+
+def _outbox_dial(path, item, timeout=None):
+    """Send one queued body by re-entering this CLI as `send --direct`, so there is
+    exactly one dial path in the codebase. Out of process on purpose: a wedged
+    dial then cannot take the flusher down with it, and 'no verdict' stays
+    distinguishable from 'refused'.
+
+    Returns (outcome, info) with outcome in sent | failed | ambiguous.
+    """
+    outbox_ensure()
+    body_path = os.path.join(OUTBOX_TMP, os.path.basename(path) + ".body")
+    os.makedirs(os.path.join(STATE, "tmp"), exist_ok=True)
+    try:
+        with open(body_path, "w") as f:
+            f.write(item["body"])            # exactly the bytes that were queued
+        cmd = _send_command() + ["--direct",
+                                 "--to", item.get("to") or "",
+                                 "--body-file", body_path]
+        started = time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout or OUTBOX_ITEM_TIMEOUT_S)
+            out, err, code = proc.stdout or "", proc.stderr or "", proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            # No verdict. The peer may well have accepted it; say so instead of
+            # guessing in the direction that makes the log look clean.
+            item.update(attempts=item.get("attempts", 0) + 1, ambiguous=True,
+                        last_attempt=time.time(),
+                        last_error="TIMEOUT -- may or may not have arrived")
+            _atomic_json(path, item)
+            return "ambiguous", {"error": item["last_error"],
+                                 "elapsed": time.time() - started}
+        elapsed = time.time() - started
+        verdict_ok, sent_id = False, None
+        try:
+            reply = json.loads(out)
+            if isinstance(reply, dict) and reply.get("ok") is True:
+                verdict_ok, sent_id = True, reply.get("id")
+        except ValueError:
+            verdict_ok = False
+        if verdict_ok:
+            # Record the verdict BEFORE deleting, so a crash here cannot make the
+            # item look unsent and get it sent twice.
+            item.update(attempts=item.get("attempts", 0) + 1, sent_id=sent_id,
+                        last_attempt=time.time(), last_error=None, ambiguous=False)
+            _atomic_json(path, item)
+            os.unlink(path)
+            return "sent", {"id": sent_id, "elapsed": elapsed}
+        head = "" if code else "exit 0 but no ok verdict from the sender"
+        pieces = [head, (out or "").strip()[:200], (err or "").strip()[-200:]]
+        tail = " | ".join(p for p in pieces if p)[:500]
+        item.update(attempts=item.get("attempts", 0) + 1, last_attempt=time.time(),
+                    last_error=f"exit {code}: {tail}")
+        _atomic_json(path, item)
+        return "failed", {"error": item["last_error"], "elapsed": elapsed, "code": code}
+    finally:
+        try:
+            os.unlink(body_path)
+        except OSError:
+            pass
+
+
 def sent_records():
     d = _sent_dir()
     out, broken = [], []
@@ -1076,6 +1301,40 @@ def cmd_doctor(a):
     owner = _ownership_note(STATE)
     if owner:
         findings.append({"sev": "note", "text": owner})
+
+    # The SENDING half. doctor has always answered "is the receiving half wired
+    # up"; nothing answered "is anything of mine stuck". That gap is why two
+    # letters sat undelivered for an hour on 2026-10-20 while the sender's box
+    # printed a clean report: the corpse was a `pending` row in sent/, and no
+    # command looked at the queue. Note severity, because a queued letter is data
+    # waiting for a peer, not running code disagreeing with disk.
+    try:
+        queued = outbox_items()
+    except OSError:
+        queued = []
+    if queued:
+        oldest = min(float((it or {}).get("created") or time.time())
+                     for _, it in queued)
+        age_min = (time.time() - oldest) / 60.0
+        amb = sum(1 for _, it in queued if isinstance(it, dict) and it.get("ambiguous"))
+        att = max([int((it or {}).get("attempts") or 0) for _, it in queued] or [0])
+        findings.append({"sev": "note",
+                         "text": f"outbox       {len(queued)} item(s) waiting, "
+                                 f"oldest {age_min:.0f}m, {att} attempt(s), "
+                                 f"{amb} ambiguous"
+                                 + ("  (flush with: inbox_agent.py outbox flush)"
+                                    if queued else "")})
+    stranded = 0
+    try:
+        recs, _broken = sent_records()
+        stranded = sum(1 for r in recs if r.get("state") == "pending")
+    except Exception:
+        stranded = 0
+    if stranded:
+        findings.append({"sev": "note",
+                         "text": f"stranded     {stranded} sent record(s) with no "
+                                 f"verdict -- these are last words, not receipts; "
+                                 f"`inbox_agent.py recover` requeues the bodies"})
 
     # NOTE severity, deliberately: these are facts about DATA, not about running code.
     # The exit code answers "is the running system consistent with the disk"; a test
@@ -1759,6 +2018,18 @@ def _read_body(a):
 
 
 def cmd_send(a):
+    """Queue first, then dial. The body outlives a failed dial.
+
+    Order matters and it used to be backwards: `sent_intent` wrote a row that said
+    "about to send" and nothing else retained the work, so a dial that died left a
+    body only the model still remembered. A human then read the `pending` row as a
+    receipt. Now the body lands in state/outbox/ BEFORE the dial and is deleted only
+    on a peer's ok:true; a failure exits 2 with the item still queued, and
+    `outbox flush` drains it later.
+
+    --direct skips the queue. It exists so the flusher can dial without queueing a
+    second copy of the thing it is currently draining (outbox -> send --direct).
+    """
     a.body = _read_body(a)
     p = peers()
     target = None
@@ -1768,18 +2039,165 @@ def cmd_send(a):
             break
     if target is None:
         sys.exit(f"unknown peer {a.to!r}; try: inbox_agent.py peers")
-    rec = sent_intent(target.get("label") or a.to, target.get("onion"), a.body)
+    label = target.get("label") or a.to
+    queued = None
+    if not getattr(a, "direct", False):
+        queued = outbox_queue(label, a.body, target.get("onion") or "")
+    rec = sent_intent(label, target.get("onion"), a.body)
     try:
         reply = send_to(target["onion"], a.body,
                         session=getattr(a, "session", None) or auto_session() or None,
                         to_session=getattr(a, "to_session", "") or None,
                         peer_fp=fp_of(target, p), peer_label=target.get("label"))
+    except (ConnectionError, RuntimeError, OSError) as exc:
+        sent_confirm(rec, None)                 # attempted and did not complete
+        if queued:
+            outbox_note_failure(queued, f"{exc.__class__.__name__}: {exc}".split("\n")[0])
+            print(f"\nqueued, not sent: {queued}", file=sys.stderr)
+            print("  the body is retained; `inbox_agent.py outbox flush` retries it",
+                  file=sys.stderr)
+            print(f"  reason: {str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__}",
+                  file=sys.stderr)
+            sys.exit(2)
+        raise
     except BaseException:
         sent_confirm(rec, None)                 # attempted and did not complete
+        if queued:
+            outbox_note_failure(queued, "aborted before a verdict")
         raise
     sent_confirm(rec, reply)
+    if reply and reply.get("ok"):
+        if queued:
+            outbox_remove(queued)
+        print(json.dumps(reply, indent=2))
+        sys.exit(0)
+    # The peer answered and said no. That is a verdict, not a failure to reach
+    # them, so keeping the body queued is right: the reason is on the item and a
+    # human (or the next flush) can act on it.
+    if queued:
+        outbox_note_failure(queued, f"peer refused: {json.dumps(reply)[:300]}")
+        print(json.dumps(reply, indent=2))
+        print(f"\nrefused, kept queued: {queued}", file=sys.stderr)
+        print("  `inbox_agent.py outbox list` shows the peer's reason", file=sys.stderr)
+        sys.exit(2)
     print(json.dumps(reply, indent=2))
-    sys.exit(0 if reply and reply.get("ok") else 1)
+    sys.exit(1)
+
+
+def cmd_outbox(a):
+    """The durable queue: what is waiting, why, and drain it."""
+    action = getattr(a, "action", "list") or "list"
+    if action == "add":
+        body = _read_body(a)
+        p = peers()
+        label = a.to
+        for fp, v in p.items():
+            if a.to in (fp, v.get("label"), fp[:12]):
+                label = v.get("label") or a.to
+                break
+        path = outbox_queue(label, body)
+        print(f"queued {path}")
+        sys.exit(0)
+    if action == "list":
+        items = outbox_items()
+        if not items:
+            print("outbox empty")
+            sys.exit(0)
+        for path, it in items:
+            name = os.path.basename(path)
+            if it is None:
+                print(f"  CORRUPT {name} -- left in place, not deleted")
+                continue
+            flag = " AMBIGUOUS" if it.get("ambiguous") else ""
+            age = (time.time() - float(it.get("created") or 0)) / 60.0
+            print(f"  {name}  to={it.get('to')}  attempts={it.get('attempts', 0)}"
+                  f"  {age:.0f}m old{flag}")
+            if it.get("last_error"):
+                print(f"     last: {it['last_error']}")
+        sys.exit(2)
+    # flush
+    items = outbox_items()
+    if not items:
+        print("outbox empty -- nothing to send")
+        sys.exit(0)
+    sent = failed = ambiguous = skipped = 0
+    started = time.time()
+    print(f"pending {len(items)} item(s) in {OUTBOX}")
+    for path, it in items:
+        if it is None:
+            print(f"  CORRUPT {os.path.basename(path)}: unreadable -- left in place")
+            failed += 1
+            continue
+        if it.get("ambiguous") and not getattr(a, "retry_ambiguous", False):
+            print(f"  skip {os.path.basename(path)}: previous attempt was AMBIGUOUS"
+                  f" ({it.get('last_error')})")
+            skipped += 1
+            continue
+        cpath = _outbox_claim(path)
+        if cpath is None:
+            print(f"  skip {os.path.basename(path)}: another flusher owns this item")
+            skipped += 1
+            continue
+        try:
+            outcome, info = _outbox_dial(path, it)
+        finally:
+            _outbox_release(cpath)
+        if outcome == "sent":
+            sent += 1
+            print(f"  sent {os.path.basename(path)}  id={info.get('id')}"
+                  f"  in {info.get('elapsed', 0):.1f}s")
+        elif outcome == "ambiguous":
+            ambiguous += 1
+            print(f"  AMBIGUOUS {os.path.basename(path)} -- kept; not retried without"
+                  f" --retry-ambiguous")
+        else:
+            failed += 1
+            print(f"  FAILED {os.path.basename(path)} -- kept")
+            print(f"         {info.get('error')}")
+    remaining = len(outbox_items())
+    print(f"\nsent {sent}, failed {failed}, ambiguous {ambiguous}, skipped {skipped}; "
+          f"{remaining} still pending, {time.time() - started:.1f}s")
+    # 0 = nothing pending, 2 = items remain. A supervisor can loop on that and
+    # stop, which is the only contract a flusher actually needs.
+    sys.exit(0 if remaining == 0 else 2)
+
+
+def cmd_recover(a):
+    """Requeue bodies stranded by the old send path.
+
+    Every row in sent/ with state `pending` was written by a send that never reached
+    a verdict. Before this change nothing retained its body as work to do, so those
+    rows are exactly the corpse this fix exists to stop producing -- but on an
+    existing box they are already there. Migrating them is a one-way, additive move:
+    queue the body, print it, and change nothing else.
+    """
+    recs, broken = sent_records()
+    pending = [r for r in recs if r.get("state") == "pending"]
+    if not pending:
+        print("no stranded sends")
+        sys.exit(0)
+    seen = {(it.get("sha256"), it.get("to"))
+            for _, it in outbox_items() if isinstance(it, dict)}
+    recovered = already = 0
+    for r in sorted(pending, key=lambda x: x.get("at") or 0):
+        body = r.get("body")
+        if not isinstance(body, str) or not body:
+            print(f"  {r.get('local_id')}: body not retained -- cannot requeue")
+            continue
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if (digest, r.get("to") or "") in seen:
+            already += 1
+            continue
+        path = outbox_queue(r.get("to") or "", body, r.get("onion") or "")
+        seen.add((digest, r.get("to") or ""))
+        recovered += 1
+        print(f"  requeued {r.get('local_id')} -> {os.path.basename(path)}"
+              f"  ({len(body)} chars to {r.get('to')})")
+    print(f"\nrecovered {recovered}, already queued {already}")
+    if broken:
+        print(f"  {len(broken)} unreadable sent record(s) skipped")
+    sys.exit(0)
+
 
 
 # ------------------------------------------------------------- tier 2: dg --
@@ -2399,7 +2817,22 @@ def main():
     p.add_argument("--session", default=None,
                    help="name of THIS session; auto-derived from the harness if omitted")
     p.add_argument("--to-session", default="", help="only deliver to this session name")
+    p.add_argument("--direct", action="store_true",
+                   help="dial once without queueing first. Used by `outbox flush` so "
+                        "draining the queue does not enqueue a second copy of the "
+                        "item being drained; also the at-most-once escape hatch")
     p.set_defaults(fn=cmd_send)
+    p = s.add_parser("outbox")
+    p.add_argument("action", choices=["list", "flush", "add"], nargs="?", default="list")
+    p.add_argument("--to", default="", help="for `add`: peer label")
+    p.add_argument("--body", default=None)
+    p.add_argument("--body-file", default=None, metavar="PATH")
+    p.add_argument("--retry-ambiguous", action="store_true",
+                   help="also retry items whose last attempt may have arrived "
+                        "(a duplicate is possible there and only there)")
+    p.set_defaults(fn=cmd_outbox)
+    p = s.add_parser("recover")
+    p.set_defaults(fn=cmd_recover)
     a, extra = ap.parse_known_args()
     # `lexicon add --kind names some free words`: options first, phrase last.
     # argparse cannot always split two positionals, so take what is left over.
