@@ -263,6 +263,63 @@ class Nonces:
 
 
 # ---------------------------------------------------------------- server --
+# ------------------------------------------------------------- body index --
+#
+# A hash of every body we have accepted, per sender, so a second copy of the same
+# bytes can be RECORDED as a second copy. Not enforced: the message is still stored
+# and still delivered. Two honest senders produce this constantly -- an at-least-once
+# flush retried after a lost verdict, a person sending the same line twice -- and a
+# transport that silently swallowed the second one would be lying about what the peer
+# said. The reader gets `dup_of` and decides.
+#
+# The index is local and per-peer. Sharing it would leak one peer's words to another,
+# which is exactly the disclosure the digest code had to fix once already.
+
+BODIES = os.path.join(STATE, "bodies.json")
+
+def _load_bodies():
+    """Tolerant: an unreadable index means 'no duplicates known', never 'drop the
+    message'. Returns {sha256: {id, received, from}} keyed by digest."""
+    try:
+        with open(BODIES) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("bodies"), dict):
+            return data["bodies"]
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_bodies(bodies):
+    tmp = BODIES + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"v": 1, "bodies": bodies}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, BODIES)
+
+
+def _body_lookup(body, fingerprint):
+    """The earlier record with these exact bytes from this sender, or None."""
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    hit = _load_bodies().get(digest)
+    if isinstance(hit, dict) and hit.get("from") == fingerprint and hit.get("id"):
+        return hit
+    return None
+
+
+def _body_record(body, fingerprint, mid, received):
+    """Remember the newest copy. Never raises into the accept path: a broken index
+    costs the duplicate ANNOTATION, which is a note, and must never cost a letter."""
+    try:
+        bodies = _load_bodies()
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        bodies[digest] = {"id": mid, "received": received, "from": fingerprint}
+        _save_bodies(bodies)
+    except OSError as e:
+        print(f"[inbox] body index not updated: {e}", flush=True)
+
+
 class Inbox:
     def __init__(self):
         self.k = keys(create=True)   # a daemon coming up is allowed to mint
@@ -465,6 +522,17 @@ class Inbox:
                         "live_sessions": sorted(k for k, v in live.items() if v)}
 
         mid = uuid.uuid4().hex[:12]
+        # DUPLICATE, RECORDED NOT ENFORCED. Same bytes arriving twice is not an
+        # error: it is what an at-least-once sender looks like from here, and it is
+        # also what a person looks like when they send the same line twice. So the
+        # second copy is stored in full -- dropping mail is this channel's cardinal
+        # sin -- and the record simply says which earlier id it matches. The reader
+        # decides; the transport does not get to have an opinion about content.
+        #
+        # Scoped to the same sender on purpose: a body-hash index shared across peers
+        # would tell one peer that another peer sent the same words, which is the
+        # third-party disclosure the digest code already had to fix once.
+        dup = _body_lookup(body, fp)
         rec = {"id": mid, "received": time.time(), "from_fingerprint": fp,
                "from_label": peer.get("label", ""), "from_onion": peer.get("onion", ""),
                # Allowlisting is checked HERE and nowhere later, so it is a fact about
@@ -473,6 +541,9 @@ class Inbox:
                # this got in" -- and those are very different questions to answer.
                "from_known": True,
                "body": body}
+        if dup:
+            rec["dup_of"] = dup["id"]
+            rec["dup_prev_received"] = dup["received"]
         for f in ("from_session", "to_session"):
             if f == "to_session" and presence:
                 # Unverified address: store the fact, not the address. Keeping it
@@ -491,8 +562,10 @@ class Inbox:
         with open(path + ".tmp", "w") as f:
             json.dump(rec, f, indent=2)
         os.replace(path + ".tmp", path)
+        _body_record(body, fp, mid, rec["received"])
         self.accepted += 1
-        print(f"[inbox] +{mid} from {peer.get('label') or fp[:12]}", flush=True)
+        print(f"[inbox] +{mid} from {peer.get('label') or fp[:12]}"
+              + (f"  (same body as {rec['dup_of']})" if dup else ""), flush=True)
         # Piggybacked digest: applied AFTER the message is safe on disk, and a bad
         # one is dropped silently-ish -- it must never cost the message. Older
         # receivers never see this because they ignore the unknown envelope key.
@@ -1705,7 +1778,11 @@ def cmd_inbox(a):
         if m.get("to_session"):
             who = f"{who} -> {m['to_session']}"
         print(f"{m['id']}  {when}  {who[:30]:30} "
-              f"{(m.get('body') or '').replace(chr(10),' ')[:60]}")
+              f"{'≡ ' if m.get('dup_of') else '  '}"
+              f"{(m.get('body') or '').replace(chr(10),' ')[:58]}")
+    if any(m.get("dup_of") for m in ms):
+        print("\n≡ = same bytes as an earlier message from that sender "
+              "(stored in full; `read <id>` names the original)")
 
 
 def cmd_read(a):

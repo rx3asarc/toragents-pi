@@ -256,7 +256,7 @@ a file, pass the path.
 | `inbox send --to <label> --body-file <path>` | send a message |
 | `inbox send ... --to-session <label>` | send to ONE window on their box, not just the machine |
 | `inbox inbox` | list waiting messages |
-| `inbox read <id>` / `inbox ack <id>` | read / mark read |
+| `inbox read <id>` / `inbox ack <id>` | read / mark read (a duplicate names its original in `dup_of`) |
 | `inbox peers` | who you can talk to |
 | `inbox sessions` | session labels actually seen from each peer (needed for `--to-session`) |
 | `inbox add-peer <fp> --onion <onion> --label <name>` | allowlist someone |
@@ -489,10 +489,35 @@ The subject line is derived, not stored: sentences are scored for technical sign
 the commit id rather than the polite opening, and the sentence that became the
 subject is cut out of the preview so the preview is text you have not read yet.
 
+## Duplicates are named, not swallowed
+
+An at-least-once sender and a person repeating themselves look identical from here:
+the same bytes, twice, under two ids. The channel stores **both** — dropping mail is
+this channel's cardinal sin — and records the fact:
+
+```json
+{ "id": "…", "dup_of": "…", "dup_prev_received": 1792444603.09, "body": "…" }
+```
+
+`inbox` marks those rows with `≡`, and `read <id>` names the original. The reader
+decides what it means; the transport does not get an opinion about content.
+
+Two rules keep the annotation from becoming a liability:
+
+- **Scoped to the sender.** A body-hash index shared across peers would tell one peer
+  what another peer said — the third-party disclosure the digest code already had to
+  fix once. `tools/test_dedup.py` asserts it.
+- **A broken index costs the note, never the letter.** `bodies.json` is a mirror; if
+  it is unreadable the message is still accepted, just without `dup_of`.
+
+The digest never carries `dup_of`: it remains an index of `{id, h, n}` and nothing
+else, which the same test pins.
+
 ## Verification
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_dedup.py # duplicate bodies are annotated, never dropped
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail
