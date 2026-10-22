@@ -262,7 +262,7 @@ a file, pass the path.
 | `inbox add-peer <fp> --onion <onion> --label <name>` | allowlist someone |
 | `inbox whoami` | your onion and fingerprint |
 | `inbox doctor` | is the receiving half wired up on this machine |
-| `inbox reach --to <label>` | measure whether they are reachable right now |
+| `inbox reach --to <label> [--json]` | classify reachability: up / down / unknown, with the next action |
 | `inbox sent list\|verify\|show <id>` | your own outbound, held whole, with hashes |
 | `inbox dg show` | delivery provenance per message, with staleness named |
 | `inbox chat --follow` | full-width transcript in a terminal pane |
@@ -489,10 +489,39 @@ The subject line is derived, not stored: sentences are scored for technical sign
 the commit id rather than the polite opening, and the sentence that became the
 subject is cut out of the preview so the preview is text you have not read yet.
 
+## Reachability is not a boolean
+
+`reach` used to answer "is the peer up?" with a sentence and an exit code, and every
+absence of evidence rounded to *unreachable*. It now names **which** failure it saw,
+and only one of them is allowed to say `down`:
+
+| state | verdict | what it means |
+| --- | --- | --- |
+| `connected` | **up** | their daemon answered the handshake with a nonce |
+| `service-refused` (`0x05`) | **down** | their tor found the service and their listener refused — their daemon is not listening |
+| `descriptor-missing` (`0x04`) | **unknown** | tor has no descriptor to route to: not published yet, or mid-publish (~182s measured) |
+| `timeout` | **unknown** | tor is still hunting for the descriptor |
+| `connected-no-handshake` | **unknown** | TCP accepted, hello sent, silence — a wedged daemon is not an absent one |
+| `local-error` | **unknown** | **this** box is misconfigured; says nothing about the peer |
+
+`0x04` and `0x05` arrive as the same exception through PySocks, so `reach` speaks
+SOCKS5 by hand to keep the reply byte — that byte is the whole question.
+
+```bash
+inbox reach --to <label>            # class, verdict, elapsed, and the next action
+inbox reach --to <label> --json     # same, machine-readable; exit 2 unless up
+```
+
+`--json` emits `{v, peer, onion, port, socks, state, verdict, elapsed, detail, next}`
+so a script can act on the class instead of grepping a sentence. Exit: `0` up, `2`
+anything else — the same three-valued habit `doctor` uses, because "cannot tell" is
+not "broken".
+
 ## Verification
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_reach.py # the five reach classes, and that only one may say "down"
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail

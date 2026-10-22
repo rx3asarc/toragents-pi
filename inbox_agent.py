@@ -592,6 +592,177 @@ def dial(target_onion, timeout=None):
         f"  Check the peer is running and tor is up on 127.0.0.1:{SOCKS_PORT}.")
 
 
+# ---------------------------------------------------------------- reach ---
+#
+# "Is the peer up?" is three questions wearing one word, and answering all three
+# with a boolean is how this project's users got told a healthy peer was dead.
+# The classes below come from tools/measure_publish.py, which measured them against
+# two real tori; what is new here is that they reach the human, and that the verdict
+# is allowed to be UNKNOWN instead of being rounded to "down".
+#
+#   0x04 host-unreachable   tor has NO DESCRIPTOR to route to. The service is not
+#                           published (or is mid-publish: measured 182s, and the
+#                           first dial after that still took 79s). UNKNOWN, because
+#                           "cannot find it" is not "it is not there".
+#   0x05 connection refused descriptor FOUND, their tor answered, their listener
+#                           refused -- their daemon is not listening. This is the
+#                           only class that licenses the word DOWN.
+#   0x00 then silence       connected, hello sent, nothing came back. A wedged
+#                           daemon, which is not the same as an absent one.
+#   socks unreachable       OUR side is misconfigured. Says nothing about the peer,
+#                           so it must never be reported as their failure.
+REACH_CONNECTED = "connected"
+REACH_REFUSED = "service-refused"
+REACH_NO_DESCRIPTOR = "descriptor-missing"
+REACH_TIMEOUT = "timeout"
+REACH_NO_HANDSHAKE = "connected-no-handshake"
+REACH_LOCAL = "local-error"
+REACH_OTHER = "other"
+
+REACH_VERDICT = {
+    REACH_CONNECTED: "up",
+    # The peer's tor knows the service and their listener refused it. Knowledge.
+    REACH_REFUSED: "down",
+    # Everything else is an absence of evidence, said as such.
+    REACH_NO_DESCRIPTOR: "unknown",
+    REACH_TIMEOUT: "unknown",
+    REACH_NO_HANDSHAKE: "unknown",
+    REACH_LOCAL: "unknown",
+    REACH_OTHER: "unknown",
+}
+
+REACH_NEXT = {
+    REACH_CONNECTED: "nothing to do",
+    REACH_REFUSED: "their tor is up but their daemon is not: they restart "
+                   "inbox_agent.py serve (not tor -- restarting tor unpublishes "
+                   "the onion for ~182s)",
+    REACH_NO_DESCRIPTOR: "not published yet, or not published any more. Wait and "
+                         "re-dial before concluding anything; a fresh install or a "
+                         "tor restart costs ~182s, and the first dial after that "
+                         "can take another 79s",
+    REACH_TIMEOUT: "tor is still hunting for the descriptor. Re-dial; do not "
+                   "reinstall (that restarts their clock)",
+    REACH_NO_HANDSHAKE: "they answered the TCP connection but not the handshake: "
+                        "their daemon may be wedged",
+    REACH_LOCAL: "fix THIS box first -- this measurement says nothing about the peer",
+    REACH_OTHER: "unclassified: read `detail`",
+}
+
+SOCKS_REP_NAMES = {
+    0x01: "general socks server failure",
+    0x02: "connection not allowed by ruleset",
+    0x03: "network unreachable",
+    0x04: "host unreachable",
+    0x05: "connection refused",
+    0x06: "ttl expired",
+    0x07: "command not supported",
+    0x08: "address type not supported",
+}
+
+
+def _socks5_connect(sock, host, port):
+    """Do the SOCKS5 handshake by hand so the REPLY CODE survives.
+
+    PySocks raises away the distinction that matters here -- 0x04 (no descriptor)
+    and 0x05 (descriptor found, listener refused) arrive as the same exception, and
+    that difference is the whole question. Returns the reply byte.
+    """
+    sock.sendall(b"\x05\x01\x00")
+    if _read_exact(sock, 2) != b"\x05\x00":
+        raise OSError("socks5: no acceptable auth method")
+    name = host[:-6] if host.endswith(".onion") else host
+    req = b"\x05\x01\x00\x03" + bytes([len(name)]) + name.encode() + port.to_bytes(2, "big")
+    sock.sendall(req)
+    head = _read_exact(sock, 4)
+    if head is None or len(head) < 4:
+        raise OSError("socks5: short reply")
+    if head[0] != 0x05:
+        raise OSError(f"socks5: bad version byte {head[0]:#x}")
+    rep, atyp = head[1], head[3]
+    if atyp == 0x01:
+        _read_exact(sock, 4 + 2)
+    elif atyp == 0x03:
+        n = _read_exact(sock, 1)
+        _read_exact(sock, (n[0] if n else 0) + 2)
+    elif atyp == 0x04:
+        _read_exact(sock, 16 + 2)
+    return rep
+
+
+def reach_probe(onion, timeout=60.0, socks_port=None):
+    """One dial, fully classified. Returns a dict -- never raises for a peer fault.
+
+    `verdict` is deliberately allowed to be "unknown": four of the seven states below
+    are an absence of evidence, and rounding them to "down" is the false negative the
+    taxonomy exists to prevent.
+    """
+    port = socks_port or SOCKS_PORT
+    out = {"v": 1, "onion": onion, "port": 80, "socks": port,
+           "state": REACH_OTHER, "verdict": "unknown", "elapsed": 0.0,
+           "detail": "", "next": ""}
+
+    def settle(state, detail, t0):
+        out.update(state=state, verdict=REACH_VERDICT.get(state, "unknown"),
+                   detail=detail, elapsed=time.monotonic() - t0,
+                   next=REACH_NEXT.get(state, ""))
+        return out
+
+    t0 = time.monotonic()
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=min(timeout, 10.0))
+    except OSError as exc:
+        # Local trouble. Calling this "peer unreachable" is the false negative this
+        # whole taxonomy exists to prevent.
+        return settle(REACH_LOCAL,
+                      f"local socks 127.0.0.1:{port} unusable: {exc.strerror or exc}", t0)
+    try:
+        sock.settimeout(timeout)
+        try:
+            rep = _socks5_connect(sock, onion, 80)
+        except socket.timeout:
+            return settle(REACH_TIMEOUT,
+                          f"no SOCKS reply within {timeout:.0f}s (tor is still "
+                          f"hunting for the descriptor)", t0)
+        except OSError as exc:
+            return settle(REACH_OTHER, f"socks: {exc}", t0)
+        if rep == 0x04:
+            return settle(REACH_NO_DESCRIPTOR,
+                          "socks-rep=0x04 host-unreachable -- tor has no descriptor "
+                          "to route to", t0)
+        if rep == 0x05:
+            return settle(REACH_REFUSED,
+                          "socks-rep=0x05 connection refused -- their tor found the "
+                          "service and their listener refused", t0)
+        if rep != 0x00:
+            return settle(REACH_OTHER,
+                          f"socks-rep=0x{rep:02x} "
+                          f"{SOCKS_REP_NAMES.get(rep, 'unknown')}", t0)
+        # Connected at the SOCKS layer: the application decides. A nonce is the only
+        # proof their DAEMON answered, as opposed to their tor accepting.
+        sock.settimeout(min(timeout, 20.0))
+        try:
+            send_msg(sock, {"op": "hello"})
+            hello = recv_msg(sock)
+        except socket.timeout:
+            return settle(REACH_NO_HANDSHAKE,
+                          "connected, hello sent, then silence -- a wedged daemon "
+                          "looks exactly like this", t0)
+        except (OSError, ValueError) as exc:
+            return settle(REACH_NO_HANDSHAKE,
+                          f"connected, then {exc.__class__.__name__}: {exc}", t0)
+        nonce = (hello or {}).get("nonce") if isinstance(hello, dict) else None
+        if isinstance(nonce, str) and nonce:
+            return settle(REACH_CONNECTED,
+                          f"handshake done, nonce {len(nonce)} chars", t0)
+        return settle(REACH_NO_HANDSHAKE,
+                      f"connected, unexpected reply: {str(hello)[:120]}", t0)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def cmd_reach(a):
     """Is the peer actually reachable, right now, through OUR tor?
 
@@ -606,9 +777,10 @@ def cmd_reach(a):
          be the instance that carries these circuits -- and descriptor fetches
          stall there while the dedicated instance answers in seconds.
 
-    So: dial port 80, report WHICH socks port did it, and time it.
+    So: dial port 80, report WHICH socks port did it, and say which of the five
+    failure classes this is -- with `unknown` available, because most of them are
+    not evidence that the peer is down.
     """
-    import time
     p = peers()
     target = None
     for fp, v in p.items():
@@ -618,26 +790,26 @@ def cmd_reach(a):
     if target is None:
         sys.exit(f"unknown peer {a.to!r}; try: inbox_agent.py peers")
     label = target.get("label") or target["onion"][:16]
+    res = reach_probe(target["onion"], timeout=float(getattr(a, "timeout", 60.0)))
+    res["peer"] = label
+    res["verdict"] = REACH_VERDICT.get(res["state"], "unknown")
+
+    if getattr(a, "json", False):
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res["verdict"] == "up" else 2)
+
     print(f"peer      {label}")
     print(f"onion     {target['onion']}")
-    print(f"dialling  {target['onion'][:16]}...:80   via socks 127.0.0.1:{SOCKS_PORT}")
-    t0 = time.time()
-    try:
-        s = dial(target["onion"], )
-    except ConnectionError as exc:
-        print(f"\n  UNREACHABLE after {time.time() - t0:.1f}s")
-        print(f"  {exc}")
-        if SOCKS_PORT == 9050:
-            print("  note: this used tor's default SOCKS port. If this machine runs a")
-            print("        dedicated tor for toragents, set socks_port in")
-            print("        <state>/config.json or TORAGENTS_SOCKS, and retry.")
-        sys.exit(2)
-    dt = time.time() - t0
-    try:
-        s.close()
-    except Exception:
-        pass
-    print(f"\n  REACHABLE in {dt:.1f}s -- their tor published, their listener accepted")
+    print(f"dialling  {target['onion'][:16]}...:80   via socks 127.0.0.1:{res['socks']}")
+    print(f"\n  {res['state']:<22} {res['verdict'].upper():<8} {res['elapsed']:.1f}s")
+    print(f"  {res['detail']}")
+    if res.get("next"):
+        print(f"  next: {res['next']}")
+    if res["state"] == REACH_LOCAL and res["socks"] == 9050:
+        print("  note: this used tor's default SOCKS port. If this machine runs a")
+        print("        dedicated tor for toragents, set socks_port in")
+        print("        <state>/config.json or TORAGENTS_SOCKS, and retry.")
+    sys.exit(0 if res["verdict"] == "up" else 2)
 
 
 def auto_session() -> str:
@@ -2386,6 +2558,12 @@ def main():
     p.set_defaults(fn=cmd_ack)
     p = s.add_parser("reach")
     p.add_argument("--to", default="")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable result: state, verdict (up/down/unknown), "
+                        "elapsed, detail, next")
+    p.add_argument("--timeout", type=float, default=60.0,
+                   help="seconds per phase (default 60). A cold descriptor is a "
+                        "curve, not a boolean: re-dial before concluding")
     p.set_defaults(fn=cmd_reach)
     p = s.add_parser("send")
     p.add_argument("--to", required=True)
