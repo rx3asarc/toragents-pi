@@ -491,6 +491,13 @@ subject is cut out of the preview so the preview is text you have not read yet.
 
 ## Verification
 
+Every test runs without network, without a live daemon and without pi: they bind
+127.0.0.1 on an ephemeral port, point `TORAGENTS_HOME` at a `tempfile` dir, and exit 0
+after printing `SKIP` when a dependency is missing. That is what makes the whole suite
+CI-shaped — `.github/workflows/tests.yml` runs it on every push and PR, on two
+interpreters, and fails the job if fewer than 40 individual checks report PASS (a run
+that skips itself is green but worthless).
+
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape

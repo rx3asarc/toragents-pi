@@ -1,0 +1,102 @@
+name: tests
+
+# Every test in this repo runs without network, without a daemon and without pi:
+# they spin a subprocess on 127.0.0.1, use tempfile state dirs, and exit 0 when a
+# dependency is missing (test_fixtures_current SKIPs loudly without pi/bun).
+#
+# So the whole suite is CI-shaped already -- it just never had a machine to run on.
+# The point of this file is that "29 passed" becomes a fact anyone can replay instead
+# of a line in somebody's terminal.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Minimum supported interpreter beside the current one: a bare `import`
+        # failure on an old python is the cheapest possible bug to catch here.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # Only what wire.py and inbox_agent.py import: PyNaCl for the signing
+        # primitives, PySocks for the SOCKS5 hop. PySocks is optional at import time
+        # in some paths, but installing it keeps the reach tests honest rather than
+        # silently skipping the code that talks to tor.
+        run: python -m pip install --upgrade pip PyNaCl PySocks
+
+      - name: Run every test
+        # Collected rather than listed: a hardcoded filename list is a list that goes
+        # stale the first time someone adds a test, and a test nobody runs is worse
+        # than no test. Each file is bounded so one hang cannot eat the job.
+        #
+        # Each file's OUTPUT is kept, because the next step has to count the checks
+        # that actually ran, and counting them by re-running the suite would run every
+        # test twice -- once to prove it passes and once, with its exit status thrown
+        # away, to count. The second run is also the one place a flake could hide: it
+        # can only lower the count, never fail the job. So: run once, keep the words.
+        run: |
+          set -uo pipefail
+          out_dir="$RUNNER_TEMP/test-output"
+          mkdir -p "$out_dir"
+          fail=0
+          for t in tools/test_*.py; do
+            name=$(basename "$t")
+            printf '%-34s ' "$name"
+            if out=$(timeout 180 python "$t" 2>&1); then
+              tail -1 <<<"$out" | sed 's/^ *//' || true
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+            else
+              rc=$?
+              echo "FAIL (rc=$rc)"
+              echo "$out" | tail -25
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Assert the suite actually asserted something
+        # A job that passes because every test SKIPped is the failure mode this file
+        # exists to prevent, and it is invisible in a green check. So count the
+        # individual PASS lines, not the exit codes: 21 files carry 61 checks today,
+        # from four of them (lint_bare_except 21, lexicon 20, doctor 13, wire 7).
+        # The floor is deliberately below that number and well above zero (a runner
+        # with no PyNaCl would SKIP almost everything).
+        #
+        # Note the margin: 61 - 40 = 21, which is exactly what one file contributes.
+        # A red count means "the suite skipped itself"; a count near 40 means reword
+        # the output of one file and the floor goes quiet instead of strict.
+        run: |
+          set -uo pipefail
+          total=0
+          for f in "$RUNNER_TEMP"/test-output/*.log; do
+            printf '%-34s %s\n' "$(basename "$f" .log)" "$(grep -cE 'PASS|passed' "$f" || true)"
+            n=$(grep -cE 'PASS|passed' "$f" || true)
+            total=$((total + n))
+          done
+          echo "asserted checks: $total"
+          if [ "$total" -lt 40 ]; then
+            echo "::error::only $total checks ran -- the suite skipped itself"
+            exit 1
+          fi
