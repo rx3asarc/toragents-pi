@@ -493,6 +493,7 @@ subject is cut out of the preview so the preview is text you have not read yet.
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_timestamp.py # sender-attested ts: stored, tamper drops, old sender fine
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail
@@ -567,6 +568,16 @@ checks the fingerprint against `peers.json`, and writes the message to
 **claims** each new message atomically (a `state/claimed/<id>` file created with
 `O_EXCL`, so two pi sessions on one machine cannot both deliver it), and injects
 it as a user turn. Server, relay, account, and identity provider: none.
+
+Every send also carries a **sender timestamp** — `ts` (the sender's clock in
+integer milliseconds) plus `tsig`, a signature over `nonce || "toragents-ts1" || ts`
+with the same key that signed the body. The receiver verifies it and stores
+`sent_at` beside its own `received`. Both are facts, not a verdict: `received` is
+our clock, `sent_at` is theirs, and the difference is transit time plus clock
+skew, which one message cannot split apart. A missing or bad `tsig` drops the
+timestamp and never the message — a clock is not a credential. Old senders that
+omit `ts` and old receivers that ignore it are both still fine: the field is an
+optional, forward-compatible envelope key, exactly like the digest.
 
 ## License
 

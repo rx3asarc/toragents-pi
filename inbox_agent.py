@@ -464,6 +464,25 @@ class Inbox:
                         "error": f"addressed to {target_session}, no live session on this box",
                         "live_sessions": sorted(k for k, v in live.items() if v)}
 
+        # Sender-attested timestamp (see send_to): the peer's clock at send,
+        # signed separately so an old receiver ignores it and a new one can store
+        # both clocks. A bad or absent signature drops the timestamp, never the
+        # message. `received` is OUR clock, `sent_at` is theirs; the difference is
+        # transit time plus clock skew, which one message cannot split apart -- so
+        # it is stored as two facts, not as a verdict about which clock is right.
+        sent_at = None
+        if "ts" in req:
+            try:
+                ts = int(req["ts"])
+                if not isinstance(req.get("tsig"), str):
+                    raise ValueError("tsig missing or not a string")
+                if sender.verify(nonce + b"toragents-ts1" + ts_canon(ts), b64d(req["tsig"])):
+                    sent_at = ts / 1000.0
+                else:
+                    print("[inbox] ts dropped: signature does not verify", flush=True)
+            except (ValueError, TypeError, binascii.Error) as e:
+                print(f"[inbox] ts dropped: {e}", flush=True)
+
         mid = uuid.uuid4().hex[:12]
         rec = {"id": mid, "received": time.time(), "from_fingerprint": fp,
                "from_label": peer.get("label", ""), "from_onion": peer.get("onion", ""),
@@ -473,6 +492,8 @@ class Inbox:
                # this got in" -- and those are very different questions to answer.
                "from_known": True,
                "body": body}
+        if sent_at is not None:
+            rec["sent_at"] = sent_at
         for f in ("from_session", "to_session"):
             if f == "to_session" and presence:
                 # Unverified address: store the fact, not the address. Keeping it
@@ -694,6 +715,17 @@ def send_to(target_onion, body, k=None, session=None, to_session=None,
             payload["dsig"] = b64e(k.sign(nonce + b"toragents-dg1" + dg_canon(dgp)))
         except Exception as e:
             print(f"[send] WARNING no digest attached: {e}", file=sys.stderr)
+        # Sender timestamp, signed like the digest so an old receiver ignores the
+        # keys and a new one can compare two clocks. Integer milliseconds (not a
+        # float) because a float's repr is a display choice, not a wire format.
+        # A failure to attach must never cost the send -- it is a clock, not a
+        # credential.
+        try:
+            ts = int(time.time() * 1000)
+            payload["ts"] = ts
+            payload["tsig"] = b64e(k.sign(nonce + b"toragents-ts1" + ts_canon(ts)))
+        except Exception as e:
+            print(f"[send] WARNING no timestamp attached: {e}", file=sys.stderr)
         send_msg(sock, payload)
         return recv_msg(sock)
     finally:
@@ -1797,6 +1829,13 @@ DG_STATES = ("delivered-both", "accepted-only", "never-stored", "mismatch", "sta
 DG_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,64}$")
 DG_H_RE = re.compile(r"^[0-9a-f]{32}$")
 DG_TOP_KEYS = {"v", "gen", "a", "b", "dsig"}
+
+
+def ts_canon(ts):
+    """Integer milliseconds as the bytes a sender signs: an int's str() is a
+    wire format; a float's repr() is a display choice. Both sides share it, so
+    a timestamp signature means exactly one thing."""
+    return str(int(ts)).encode("ascii")
 
 
 def dg_canon(d):
