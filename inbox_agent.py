@@ -1005,6 +1005,171 @@ def _inbox_artifact_report(state_dir):
     return sorted(strangers), sorted(artifacts)
 
 
+# ---------------------------------------------------------------- update --
+#
+# The trap this exists to remove, measured on this project on 2026-10-20: the file
+# in the repo is toragents_watch.ts and the installer writes it out as
+# toragents-inbox.ts. So `git pull` updates the SOURCE, pi keeps loading the OLD
+# copy, and `/reload` faithfully reloads the stale file. Every symptom of a missing
+# feature is present and the cause is a filename.
+#
+# The second trap is the same shape one level up: a window reports the version
+# literal it was COMPILED with, so after a correct copy the pane still reports the
+# old number until pi is reloaded. Copying and reloading are two different acts and
+# this command can only do the first -- so it says so, and exits 2 (cannot verify
+# yet) rather than 0 (done) when a reload is what remains.
+
+UPDATE_MAP = (
+    # (source name in the repo, destination name under <pi>/extensions/)
+    ("toragents_watch.ts", "toragents-inbox.ts"),
+    ("toragents-panel.ts", "toragents-panel.ts"),
+)
+UPDATE_LIB_MAP = (
+    ("_lib/toragents-transcript.ts", "_lib/toragents-transcript.ts"),
+    ("_lib/toragents-side-column.ts", "_lib/toragents-side-column.ts"),
+    ("_lib/toragents-policy.ts", "_lib/toragents-policy.ts"),
+)
+UPDATE_AGENT_FILES = ("inbox_agent.py", "wire.py")
+
+
+def update_ext_dir():
+    """Resolve pi's extension directory the way pi does, not the way we assume.
+
+    Same rule as doctor's, deliberately shared: a diagnostic that resolves the path
+    differently from the thing it inspects is a detector for the wrong machine.
+    """
+    pi_dir = os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".pi", "agent")
+    return os.path.join(pi_dir, "extensions")
+
+
+def _sha_of(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _declared_version(path, name="EXT_VERSION"):
+    """The version literal a source file declares. Read with a regex, not imported:
+    importing a pi extension from a CLI would need pi's runtime, and the point is to
+    report what was COPIED rather than what could be loaded here."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                # A version may be a quoted string (EXT_VERSION = "5") or a bare
+                # number (PANEL_VERSION = 4). Both are literals a window reports; the
+                # regex has to accept both or it silently reports nothing for half the
+                # files, which reads as "this file declares no version".
+                m = re.search(r"(?:export\s+const\s+)?" + name
+                              + r"\s*=\s*['\"]?([0-9A-Za-z._-]+)['\"]?", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        return None
+    return None
+
+
+def cmd_update(a):
+    """Install a checked-out source tree into pi, without the rename trap.
+
+    Deliberately does NOT fetch. Fetched code is code nobody reviewed, and this
+    project pins installers to a commit SHA for exactly that reason. --pull opts in
+    and says which commit it moved to; without it, update installs what is already
+    on disk, which is also what makes it testable.
+    """
+    src = (getattr(a, "from_dir", None) or os.environ.get("TORAGENTS_SRC")
+           or os.path.join(os.path.expanduser("~"), "toragents-pi"))
+    ext_dir = getattr(a, "ext_dir", None) or update_ext_dir()
+
+    if getattr(a, "pull", False):
+        if not os.path.isdir(os.path.join(src, ".git")):
+            sys.exit(f"--pull: {src} is not a git checkout")
+        proc = subprocess.run(["git", "-C", src, "pull", "--ff-only"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            sys.exit("--pull failed (fast-forward only):\n"
+                     + (proc.stderr.strip() or proc.stdout.strip()))
+        head = subprocess.run(["git", "-C", src, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        print(f"pulled    {src} -> {head}")
+
+    if not os.path.isfile(os.path.join(src, UPDATE_MAP[0][0])):
+        sys.exit(f"no source tree at {src}\n"
+                 f"  expected {UPDATE_MAP[0][0]}\n"
+                 f"  clone it:  git clone https://github.com/rx3asarc/toragents-pi {src}\n"
+                 f"  or point elsewhere:  inbox_agent.py update --from <dir>")
+
+    pairs = [(s, os.path.join(ext_dir, d)) for s, d in UPDATE_MAP]
+    pairs += [(s, os.path.join(ext_dir, d)) for s, d in UPDATE_LIB_MAP]
+
+    copied, unchanged, missing, failed = [], [], [], []
+    for srel, dest in pairs:
+        sp = os.path.join(src, srel)
+        if not os.path.isfile(sp):
+            missing.append(srel)
+            continue
+        before, after = _sha_of(dest), _sha_of(sp)
+        if before is not None and before == after:
+            unchanged.append(os.path.basename(dest))
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if before is not None:
+                # A stale copy is exactly what this command exists to overwrite, and
+                # exactly what a rollback needs. Same policy as the installer: never
+                # rename anything on the way in (the imports are by filename).
+                shutil.copy2(dest, dest + ".bak")
+            shutil.copy2(sp, dest)
+            vname = "PANEL_VERSION" if "panel" in srel else "EXT_VERSION"
+            copied.append((srel, os.path.basename(dest), _declared_version(sp, vname), vname))
+        except OSError as e:
+            failed.append((srel, str(e)))
+
+    for srel, name, ver, vname in copied:
+        print(f"copied    {srel:34} -> {name}" + (f"  ({vname} {ver})" if ver else ""))
+    if unchanged:
+        print(f"unchanged {len(unchanged)} file(s): {', '.join(unchanged)}")
+    for srel in missing:
+        print(f"MISSING   {srel} -- not in the source tree; nothing copied for it")
+    for srel, err in failed:
+        print(f"FAILED    {srel}: {err}")
+
+    # The daemon half is a different process with a different restart. Report drift
+    # rather than fixing it: a daemon restart drops live connections, and that is a
+    # decision, not a side effect of a copy.
+    agent_drift = [n for n in UPDATE_AGENT_FILES
+                   if os.path.isfile(os.path.join(src, n))
+                   and _sha_of(os.path.join(src, n)) != _sha_of(os.path.join(HOME, n))]
+    agent_ver = _declared_version(os.path.join(src, "inbox_agent.py"), "AGENT_VERSION")
+    if agent_drift:
+        print(f"\ndaemon    source differs: {', '.join(agent_drift)}")
+        print(f"          running daemon is {_daemon_version()}, source tree declares "
+              f"{agent_ver or '?'}"
+              + ("  -- same version, DIFFERENT BYTES: the file is not the code that "
+                 "is running" if _daemon_version() == agent_ver else ""))
+        if getattr(a, "update_agent", False):
+            for n in agent_drift:
+                shutil.copy2(os.path.join(src, n), os.path.join(HOME, n))
+            print("          copied; RESTART the daemon to load it")
+        else:
+            print("          not copied -- re-run with --agent to install it too")
+
+    if failed:
+        sys.exit(1)
+    if not copied:
+        print("\nalready current: pi is loading the files in the source tree")
+        sys.exit(0)
+    print("\nNEXT: in every pi window, run /reload -- a window keeps the extension it\n"
+          "      COMPILED, so the copy is invisible to it until it reloads.\n"
+          "      then verify: inbox_agent.py doctor   (the ext= lines)")
+    # 2, not 0: the copy happened, and nothing can claim it works until a window
+    # reloads and reports the new literal. 'cannot verify yet' is a different answer
+    # from 'done' and a different answer from 'broken'.
+    sys.exit(2)
+
+
 def cmd_doctor(a):
     """Answer "is the receiving half wired up on THIS machine?" -- measured.
 
@@ -2400,6 +2565,18 @@ def main():
                    help="name of THIS session; auto-derived from the harness if omitted")
     p.add_argument("--to-session", default="", help="only deliver to this session name")
     p.set_defaults(fn=cmd_send)
+    p = s.add_parser("update")
+    p.add_argument("--from", dest="from_dir", default=None,
+                   help="source tree to install from (default: $TORAGENTS_SRC or ~/toragents-pi)")
+    p.add_argument("--pull", action="store_true",
+                   help="git pull --ff-only in the source tree first (refuses otherwise); "
+                        "off by default because fetched code is unreviewed code")
+    p.add_argument("--agent", dest="update_agent", action="store_true",
+                   help="also copy inbox_agent.py and wire.py (you must restart the daemon)")
+    p.add_argument("--ext-dir", default=None,
+                   help="destination extension dir (default: pi's own rule, "
+                        "PI_CODING_AGENT_DIR or ~/.pi/agent/extensions)")
+    p.set_defaults(fn=cmd_update)
     a, extra = ap.parse_known_args()
     # `lexicon add --kind names some free words`: options first, phrase last.
     # argparse cannot always split two positionals, so take what is left over.

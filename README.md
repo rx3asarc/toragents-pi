@@ -264,6 +264,7 @@ a file, pass the path.
 | `inbox doctor` | is the receiving half wired up on this machine |
 | `inbox reach --to <label>` | measure whether they are reachable right now |
 | `inbox sent list\|verify\|show <id>` | your own outbound, held whole, with hashes |
+| `inbox update --from <dir>` | install a checkout into pi, renaming `toragents_watch.ts` → `toragents-inbox.ts` for you |
 | `inbox dg show` | delivery provenance per message, with staleness named |
 | `inbox chat --follow` | full-width transcript in a terminal pane |
 
@@ -489,10 +490,42 @@ The subject line is derived, not stored: sentences are scored for technical sign
 the commit id rather than the polite opening, and the sentence that became the
 subject is cut out of the preview so the preview is text you have not read yet.
 
+## Updating an installed copy
+
+The repo file is called `toragents_watch.ts` and the installer writes it out as
+`toragents-inbox.ts`. That renaming is load-bearing (pi loads the extension by the
+name the installer chose) and it is also a trap: `git pull` updates the **source**,
+pi keeps loading the **old copy**, and `/reload` reloads the stale file faithfully.
+Every symptom of a missing feature is present and the cause is a filename.
+
+```bash
+inbox update --from ~/toragents-pi          # copy, with the rename applied
+```
+
+That copies `toragents_watch.ts → toragents-inbox.ts`, `toragents-panel.ts`, and
+`_lib/toragents-*.ts`, keeping a `.bak` of anything it overwrites, and reports the
+version literal it actually copied. It **does not fetch** — fetched code is
+unreviewed code, which is why installers here pin to a commit SHA. `--pull` opts in
+and prints the commit it moved to. `--agent` also copies `inbox_agent.py` and
+`wire.py` (you restart the daemon yourself; a copy is not a restart).
+
+Then `/reload` in every pi window. A window keeps the extension it **compiled**, so
+the copy is invisible to it until it reloads — and `doctor`'s `ext=` line is the
+only thing that can tell you whether the window you are looking at is running the
+file you just copied.
+
+Exit codes: `0` nothing to do, `2` copied but **unverified** (a reload is what
+remains), `1` broken. `2` is not a failure — it is the honest answer to "did this
+work", given that only a reloaded window can say.
+
+It is idempotent by hash: a second run copies nothing and touches no mtimes, so it
+can go in a loop or a hook without rewriting files under a running window.
+
 ## Verification
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_update.py # the rename trap: watch.ts installs as inbox.ts, idempotent
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail
