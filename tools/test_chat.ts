@@ -3,6 +3,7 @@
  * direction, newest last, and no entry for anything that never crossed the wire.
  */
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -59,11 +60,24 @@ checks.push(
 
 // freshWords: the pool must actually be consulted, and a broken daemon must not
 // turn a send into a failure.
+//
+// The pool is reached by running inbox_agent.py, which imports PyNaCl. When the
+// interpreter cannot import it the spawn fails, freshWords returns empty by design
+// (a broken daemon must not fail a send), and this check reports "no words" -- the
+// right verdict for the wrong reason, with nothing in the output saying so. Say it.
+const py = process.env.TORAGENTS_PY || "python3";
+{
+	const probe = spawnSync(py, ["-c", "import nacl"], { encoding: "utf8" });
+	if (probe.status !== 0) {
+		console.log(`  note: ${py} cannot import nacl, so the pool check below will fail;`);
+		console.log(`        set TORAGENTS_PY to an interpreter that can (CI installs PyNaCl)`);
+	}
+}
 checks.push(
 	["fresh words come back from the pool",
 		(() => {
 			const r = mod.freshWords(
-				process.env.TORAGENTS_PY || "python3",
+				py,
 				join(process.cwd(), "inbox_agent.py"),
 				HOME,
 				join(STATE, "peers.json"), // any readable file: the body only marks words

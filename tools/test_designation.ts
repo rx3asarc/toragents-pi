@@ -23,7 +23,7 @@
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as mod from "/mnt/HC_Volume_105587324/toragents-pi/toragents_watch.ts";
+import * as mod from "../toragents_watch.ts";
 
 const checks: Array<[string, boolean]> = [];
 const now = Date.now();
@@ -60,10 +60,17 @@ const other = { pid: process.pid, session: "pi-otherid", name: "stella" };
 }
 
 // 3. a non-receiver stays passive while the desk is live
+//
+// The desk writes its own heartbeat, and since 22 Oct that heartbeat is part of how
+// "live" is established: a probe that cannot signal the desk answers `unknown`, and the
+// owner's own record is what turns unknown into "present". A fixture without one would
+// be describing a desk that left no trace -- which is a different test, and it is case 8.
 {
 	const { d, S } = mk();
 	policy(d, { receiver: "rowan" });
 	mod.electConsumer(S, desk, now);
+	mkdirSync(join(S, "live"), { recursive: true });
+	writeFileSync(join(S, "live", "desk.json"), JSON.stringify({ pid: desk.pid, at: now }));
 	const r = mod.electConsumer(S, other, now + 1000);
 	checks.push(["a non-receiver does NOT take untargeted mail from the desk", !r.tookOver]);
 	checks.push(["...and says why", /designated receiver/.test(r.reason)]);
@@ -140,6 +147,37 @@ const other = { pid: process.pid, session: "pi-otherid", name: "stella" };
 	const r = mod.electConsumer(S, other, now);
 	checks.push(["a corrupt policy file falls back to first-come", r.tookOver]);
 	checks.push(["...and reports nothing loaded", !mod.readPolicy(S).loaded]);
+}
+
+// 8. the same unsignalable desk, but it left no heartbeat -> presumed gone, and a silent
+// channel is the worse failure. This is the cell a boolean default used to decide; now it
+// is decided by evidence, and the absence of evidence is itself a fact.
+{
+	const { d, S } = mk();
+	policy(d, { receiver: "rowan" });
+	// both clocks stale: the claim is a minute old and there is no heartbeat at all, which is
+	// the only state where nothing on disk speaks for the owner.
+	writeFileSync(join(S, "consumer.json"),
+		JSON.stringify({ pid: desk.pid, session: "pi-deskid", name: "rowan", at: now - 120_000 }));
+	const r = mod.electConsumer(S, other, now);
+	checks.push(["a desk with no heartbeat and a stale claim is presumed gone, so the channel is not muted",
+		r.tookOver]);
+	checks.push(["...and the takeover names the obstacle it decided against",
+		/not signalable|stale|dead/i.test(r.reason)]);
+}
+
+// 9. the desk cannot be signalled, left no heartbeat, but its consumer write is ten seconds old.
+// That is the owner talking: a timestamp it left itself. The first table threw this away and
+// handed over the mail; the correction OR-s the two witnesses instead of voting. No designation
+// here on purpose -- with one, the designation answer (and its reason) is the right one, and the
+// muted path would never be reached.
+{
+	const { S } = mk();
+	writeFileSync(join(S, "consumer.json"),
+		JSON.stringify({ pid: desk.pid, session: "pi-deskid", name: "rowan", at: now - 10_000 }));
+	const r = mod.electConsumer(S, other, now);
+	checks.push(["a fresh consumer write with no heartbeat is NOT a handover", !r.tookOver]);
+	checks.push(["...and it is named as unresolved, not as an owner", r.escalate === "muted"]);
 }
 
 let bad = 0;

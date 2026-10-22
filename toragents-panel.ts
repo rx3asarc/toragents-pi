@@ -69,7 +69,7 @@ import {
  * Self-declared for now, and reported when the pane mounts. It is not yet consumed
  * by doctor; when it is, it should come from here rather than from a second copy.
  */
-export const PANEL_VERSION = 7;
+export const PANEL_VERSION = 8;
 
 const WIDTH_DEFAULT = 46;
 const MIN_TERMINAL = 110;
@@ -206,7 +206,42 @@ export function subject(body: string, max = SUBJECT_MAX): string {
  * text, which is the opposite of a preview. Removing the claimed sentence makes
  * the preview show what you have NOT already read.
  */
-export function claimBody(body: string, max = SUBJECT_MAX): { subject: string; rest: string } {
+/**
+ * The aside is a field, and the panel was mining it as prose.
+ *
+ * `♡` opens a letter and the rest of that line is the one thing the letter says about
+ * nobody's work. The row already prints a subject line, so the aside belongs there -- once.
+ * What happened instead: the scorer picked the aside as the most interesting sentence, printed
+ * it as the subject, and then the expanded body printed it again as line one. A marker that
+ * appears twice is not a marker, it is a rendering bug that reads as a stutter.
+ *
+ * So: split it off, and let the caller print the rest.
+ */
+export function splitAside(body: string): { aside: string; rest: string } {
+	const text = String(body || "").replace(/\r/g, "");
+	const lines = text.split("\n");
+	let i = 0;
+	while (i < lines.length && !lines[i].trim()) i++;
+	const first = (lines[i] || "").trim();
+	if (!first.startsWith("\u2661")) return { aside: "", rest: text };
+	const aside = first
+		.slice(1)
+		.trim()
+		.replace(/^\*\*/, "")
+		.replace(/\*\*$/, "")
+		.trim();
+	return { aside, rest: lines.slice(i + 1).join("\n").trim() };
+}
+
+export function claimBody(
+	body: string,
+	max = SUBJECT_MAX,
+): { subject: string; rest: string; aside?: boolean } {
+	const split = splitAside(body);
+	if (split.aside) {
+		const subj = split.aside.length > max ? split.aside.slice(0, Math.max(1, max - 1)) + "…" : split.aside;
+		return { subject: subj, rest: split.rest, aside: true };
+	}
 	const text = String(body || "").replace(/\r/g, "\n").trim();
 	if (!text) return { subject: "(empty)", rest: "" };
 	const rawSentences = text
@@ -389,7 +424,10 @@ export function renderColumn(
 			.map((l) => l.trim())
 			.filter(Boolean)
 			.join("\n");
-		const bodyLines = wrapBlock(open ? m.body : previewText, inner - 2);
+		// The row's subject line IS the aside when there is one, so the expanded body starts
+		// at the voice line. Printing both is the duplicate the panel shipped for one evening.
+		const bodyText = open && claimed.aside ? claimed.rest : open ? m.body : previewText;
+		const bodyLines = wrapBlock(bodyText, inner - 2);
 		if (!open && m.repeatOf) {
 			lines.push(truncateToWidth(dim(`   ↑ byte-identical repeat — enter opens it anyway`), width, ""));
 		} else if (open) {

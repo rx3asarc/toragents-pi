@@ -126,7 +126,7 @@ delete process.env.TORAGENTS_PANEL;
 
 const { markRepeats, readMailFacts, readThread, threadSignature, tldr } = await import("../_lib/toragents-transcript.ts");
 const { SideColumn, clampColumnWidth, dividerIntent, parseSgrMouse } = await import("../_lib/toragents-side-column.ts");
-const { PANEL_VERSION, repliesByPeer, renderColumn, renderFooter, renderStrip, statusSummary, subject, waitingOn } = await import("../toragents-panel.ts");
+const { PANEL_VERSION, claimBody, repliesByPeer, renderColumn, renderFooter, renderStrip, splitAside, statusSummary, subject, waitingOn } = await import("../toragents-panel.ts");
 const { POLICY_DEFAULTS, isReceiver, panelMode, policyPath, readPolicy, writePanelWidth } = await import("../_lib/toragents-policy.ts");
 
 const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
@@ -134,7 +134,7 @@ const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 // The reader's self-declared version, pinned the way EXT_VERSION is: a change to how
 // the pane behaves must arrive with a bump, or a window loaded before it will keep
 // rendering the old shape and look healthy. Change this pair together, deliberately.
-ok(PANEL_VERSION === 7, `the reader is panel v7 (found v${PANEL_VERSION}) — bump both sides together`);
+ok(PANEL_VERSION === 8, `the reader is panel v8 (found v${PANEL_VERSION}) — bump both sides together`);
 
 // ── 1. the transcript merge ────────────────────────────────────────────────
 const rows = readThread();
@@ -170,6 +170,20 @@ ok(subject("").length > 0, "an empty body still yields a subject");
 ok(subject("thanks! also, the fix is in 1d8c847 and wire.py line 335 is wrong.").includes("1d8c847"), "the subject prefers the sentence carrying the identifier");
 ok(!/^(hi|hey|hello|thanks|thank you)\b/i.test(subject(messages[0].body)), "a greeting is not the subject");
 ok(!/^(so|and|but|also)\b/i.test(subject("so build it once, and then have the reader notice.")), "a subject does not start mid-sentence on a conjunction");
+// The aside is a field, and printing it twice made a marker look like a stutter: the row
+// shows it as the subject, so the expanded body must start at the voice line.
+{
+	const withAside = "♡ **stop writing methodology notes.**\n\nkisu — a format test.\n\nsettled — bold moved";
+	const c = claimBody(withAside, 60);
+	ok(c.aside === true, "a letter opening with the glyph reports an aside");
+	ok(c.subject === "stop writing methodology notes.", "the aside IS the subject, verbatim and unmarked");
+	ok(!c.rest.includes("stop writing methodology"), "the aside does not appear again in the body");
+	ok(c.rest.startsWith("kisu"), "the body starts at the voice line");
+	const noAside = claimBody("kisu — a normal letter.\n\nsettled — something", 60);
+	ok(!noAside.aside, "a letter with no aside is unchanged");
+	ok(claimBody("  \n ♡ unmarked heart\n\nbody", 60).aside === true, "leading blank lines do not hide the aside");
+	ok(splitAside("♡ **x**").rest === "", "an aside-only body leaves an empty rest");
+}
 
 // ── 3. the geometry ────────────────────────────────────────────────────────
 const kOf = (m: any) => `${m.dir}:${m.id}`;

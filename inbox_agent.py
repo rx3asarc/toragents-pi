@@ -1922,7 +1922,7 @@ WRITER_FILE = "_writer.json"
 # RECEIVER, and both of them run on this box. A pi window loads its module at start
 # and is invisible to that comparison -- so a stale window passes every check we had
 # while running old delivery logic. That is the trap this number exists to expose.
-EXPECTED_EXT_VERSION = "5"
+EXPECTED_EXT_VERSION = "8"
 
 
 def writer_state(state_dir):

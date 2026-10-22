@@ -1,0 +1,182 @@
+name: tests
+
+# Every test in this repo runs without network, without a daemon and without pi:
+# they spin a subprocess on 127.0.0.1, use tempfile state dirs, and exit 0 when a
+# dependency is missing (test_fixtures_current SKIPs loudly without pi/bun).
+#
+# So the whole suite is CI-shaped already -- it just never had a machine to run on.
+# The point of this file is that "29 passed" becomes a fact anyone can replay instead
+# of a line in somebody's terminal.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Minimum supported interpreter beside the current one: a bare `import`
+        # failure on an old python is the cheapest possible bug to catch here.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # Only what wire.py and inbox_agent.py import: PyNaCl for the signing
+        # primitives, PySocks for the SOCKS5 hop. PySocks is optional at import time
+        # in some paths, but installing it keeps the reach tests honest rather than
+        # silently skipping the code that talks to tor.
+        run: python -m pip install --upgrade pip PyNaCl PySocks
+
+      - name: Run every test
+        # Collected rather than listed: a hardcoded filename list is a list that goes
+        # stale the first time someone adds a test, and a test nobody runs is worse
+        # than no test. Each file is bounded so one hang cannot eat the job.
+        #
+        # Each file's OUTPUT is kept, because the next step has to count the checks
+        # that actually ran, and counting them by re-running the suite would run every
+        # test twice -- once to prove it passes and once, with its exit status thrown
+        # away, to count. The second run is also the one place a flake could hide: it
+        # can only lower the count, never fail the job. So: run once, keep the words.
+        run: |
+          set -uo pipefail
+          out_dir="$RUNNER_TEMP/test-output"
+          mkdir -p "$out_dir"
+          fail=0
+          for t in tools/test_*.py; do
+            name=$(basename "$t")
+            printf '%-34s ' "$name"
+            if out=$(timeout 180 python "$t" 2>&1); then
+              tail -1 <<<"$out" | sed 's/^ *//' || true
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+            else
+              rc=$?
+              echo "FAIL (rc=$rc)"
+              echo "$out" | tail -25
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Assert the suite actually asserted something
+        # A job that passes because every test SKIPped is the failure mode this file
+        # exists to prevent, and it is invisible in a green check. So count the
+        # individual PASS lines, not the exit codes: 21 files carry 61 checks today,
+        # from four of them (lint_bare_except 21, lexicon 20, doctor 13, wire 7).
+        # The floor is deliberately below that number and well above zero (a runner
+        # with no PyNaCl would SKIP almost everything).
+        #
+        # Note the margin: 61 - 40 = 21, which is exactly what one file contributes.
+        # A red count means "the suite skipped itself"; a count near 40 means reword
+        # the output of one file and the floor goes quiet instead of strict.
+        run: |
+          set -uo pipefail
+          total=0
+          for f in "$RUNNER_TEMP"/test-output/*.log; do
+            printf '%-34s %s\n' "$(basename "$f" .log)" "$(grep -cE 'PASS|passed' "$f" || true)"
+            n=$(grep -cE 'PASS|passed' "$f" || true)
+            total=$((total + n))
+          done
+          echo "asserted checks: $total"
+          if [ "$total" -lt 40 ]; then
+            echo "::error::only $total checks ran -- the suite skipped itself"
+            exit 1
+          fi
+
+  # The python job above was the whole gate, and it never looked at this half.
+  # 16 of the repo's 37 test files are TypeScript -- the pane, the panel, the chat
+  # transcript, session labels, designation, the race -- which is the surface the
+  # rename trap lived on. So "green" meant "the daemon's python is fine", and the
+  # window could be broken while the checkmark stood.
+  #
+  # Three of these were red when this job was first written, and none of them was
+  # the test being wrong: a hardcoded path from another machine, a liveness probe
+  # that read EPERM as death, and a renderer that read a clock its test could not
+  # reach. That is what an unrun suite accumulates, and the point of running it is
+  # to find out rather than to assume it was fine.
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned, not latest: the numbers in this repo are measured on a known
+          # bun, and a runner that upgrades itself is a result that moves.
+          bun-version: "1.3.4"
+
+      # One of these tests reaches the word pool by spawning inbox_agent.py, so the
+      # job needs a python that can import PyNaCl -- the same interpreter the pool
+      # check will find as `python3`.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip PyNaCl PySocks
+
+      - name: Run every TypeScript test
+        run: |
+          set -uo pipefail
+          out_dir="$RUNNER_TEMP/ts-output"
+          mkdir -p "$out_dir"
+          fail=0
+          for t in tools/test_*.ts; do
+            name=$(basename "$t")
+            printf '%-30s ' "$name"
+            if out=$(timeout 180 bun "$t" 2>&1); then
+              tail -1 <<<"$out" | sed 's/^ *//' || true
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+            else
+              rc=$?
+              echo "FAIL (rc=$rc)"
+              echo "$out" | tail -25
+              printf '%s\n' "$out" > "$out_dir/$name.log"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Assert they asserted something
+        # Same floor logic as the python job, and the same failure it guards: a run
+        # where every file printed a header and exited 0. Measured today: 292 counted
+        # lines across 16 files, lopsided (the panel alone contributes 156). So the
+        # total is a weak signal and the per-file one is not: every file has to have
+        # said something, because a file that says nothing passed nothing.
+        run: |
+          set -uo pipefail
+          total=0
+          silent=0
+          for f in "$RUNNER_TEMP"/ts-output/*.log; do
+            n=$(grep -cEi 'pass|ok' "$f" || true)
+            printf '%-30s %s\n' "$(basename "$f" .log)" "$n"
+            total=$((total + n))
+            [ "$n" -eq 0 ] && silent=$((silent + 1))
+          done
+          echo "counted lines: $total, silent files: $silent"
+          if [ "$silent" -ne 0 ]; then
+            echo "::error::$silent TypeScript test file(s) reported nothing -- a file that says nothing passed nothing"
+            exit 1
+          fi
+          if [ "$total" -lt 100 ]; then
+            echo "::error::only $total counted lines -- the TypeScript suite skipped itself"
+            exit 1
+          fi
