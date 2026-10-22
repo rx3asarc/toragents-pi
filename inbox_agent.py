@@ -911,6 +911,32 @@ def _mismatch_sentence(got, expected):
             f"cannot help, it is already newer than we are")
 
 
+def pid_alive(pid):
+    """Is this pid running?
+
+    The question is not "may I signal it". os.kill(pid, 0) raises PermissionError
+    (EPERM) for a live process owned by another user -- every process you do not
+    own, pid 1 included -- and treating that as death is how a desk that is very
+    much alive gets declared gone and its mail handed to the next window to look.
+    Only ESRCH means gone. Everything else is an error, and an error is not
+    evidence of absence: this repo has a lesson about that (docs/LESSONS.md) and
+    still committed it in four separate places.
+
+    So: True on success, False only for ProcessLookupError, True for anything else
+    we cannot interpret. The wrong direction costs a stale window some mail it
+    will never read; the other direction loses mail that was already delivered.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False                      # True is an int, and pid 1 is not pid JSON-true
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:            # ESRCH: no such process
+        return False
+    except OSError:                       # EPERM and anything unanticipated
+        return True
+
+
 def _window_versions(state_dir):
     """Each live window's self-reported extension build, from what it wrote itself."""
     d = os.path.join(state_dir, "live")
@@ -927,13 +953,7 @@ def _window_versions(state_dir):
         except (OSError, ValueError):
             continue
         pid = rec.get("pid")
-        alive = False
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
+        alive = pid_alive(pid)
         age = (now * 1000.0 - float(rec.get("at") or 0)) / 1000.0
         if not alive or age >= (LIVE_STALE_MS / 1000.0):
             continue                      # a dead window's build is not a claim
@@ -1902,13 +1922,7 @@ def live_labels(state_dir):
         # never read it. Compare ms to ms, then convert to seconds.
         age = (now * 1000.0 - float(rec.get("at") or 0)) / 1000.0
         pid = rec.get("pid")
-        alive = False
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
+        alive = pid_alive(pid)
         live[label] = alive and age < (LIVE_STALE_MS / 1000.0)
     return live
 
@@ -1960,13 +1974,7 @@ def writer_state(state_dir):
         return "absent"
     age = (time.time() * 1000.0 - float(rec.get("at") or 0)) / 1000.0
     pid = rec.get("pid")
-    alive = False
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except OSError:
-            alive = False
+    alive = pid_alive(pid)
     if not alive or age >= (LIVE_STALE_MS / 1000.0):
         return "stale"
     # The marker that LICENSES A REFUSAL must itself be current. A pre-version

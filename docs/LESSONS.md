@@ -348,6 +348,35 @@ detector would join its own list of absences read as facts. So the same three st
 are needed one level up: fresh writer + zero windows = none; absent writer = cannot
 answer, exit non-zero; stale writer = cannot answer.
 
+### The fifth instance, and the reason the lesson was not enough
+
+The same week this was written down, the code did it four more times, in four
+places at once:
+
+```
+os.kill(pid, 0) -> except OSError: alive = False       (live-set builder)
+os.kill(pid, 0) -> except OSError: alive = False       (presence read)
+os.kill(pid, 0) -> except OSError: alive = False       (trust anchor)
+process.kill(pid, 0) -> catch: return false            (consumer election)
+```
+
+EPERM is not ESRCH. `kill(pid, 0)` asks "may I signal this", and for a process you do
+not own -- another user's daemon, and pid 1 on every machine -- the answer is "you
+may not ask", not "it is gone". Read as death, a front desk that was very much alive
+was declared gone, `fallbackToAnyone` took over, and untargeted mail went to the next
+window that looked. In the trust-anchor case it also licenses accepting unverified
+mail, because "cannot answer" degrades to accept.
+
+It survived review and testing for the usual reason, as far as we can tell: the
+machine it was written and watched on ran as root, and root may signal pid 1, so the
+only box anyone looked at was the one box where the bug is invisible.
+
+So the answer is not a better paragraph. `tools/lint_liveness.py` now refuses a
+handler that concludes DEAD without naming ProcessLookupError, `pid_alive()` is the
+one function that answers the question, and `test_pid_alive.py` proves the direction
+by patching the EPERM case the laptop actually hits. A lesson that is not mechanised
+is a preference.
+
 ## A diagnostic line must be derived from the account that sets the status
 
 A daemon/version mismatch printed a warning and never joined the problem list, so
