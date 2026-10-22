@@ -261,6 +261,7 @@ a file, pass the path.
 | `inbox sessions` | session labels actually seen from each peer (needed for `--to-session`) |
 | `inbox add-peer <fp> --onion <onion> --label <name>` | allowlist someone |
 | `inbox whoami` | your onion and fingerprint |
+| `inbox clock [--json]` | how far apart the two clocks are, estimated from signed timestamps |
 | `inbox doctor` | is the receiving half wired up on this machine |
 | `inbox reach --to <label>` | measure whether they are reachable right now |
 | `inbox sent list\|verify\|show <id>` | your own outbound, held whole, with hashes |
@@ -489,10 +490,44 @@ The subject line is derived, not stored: sentences are scored for technical sign
 the commit id rather than the polite opening, and the sentence that became the
 subject is cut out of the preview so the preview is text you have not read yet.
 
+## Two clocks, and how far apart they are
+
+Every message carries the sender's clock (`sent_at`, from the timestamp field) beside
+ours (`received`). Their difference is transit time **plus** skew, and one message
+cannot split those apart — so nothing here pretends to. The estimate is the
+**minimum** across samples, because transit is non-negative and the smallest
+difference is therefore the sample least polluted by network time:
+
+```
+offset = min(received - sent_at)     # a LOWER BOUND on their skew
+spread = median(delta) - min(delta)  # how much transit varies
+```
+
+```bash
+inbox clock            # per peer: offset, sample count, spread, and what it means
+inbox clock --json     # {n, offset_s, spread_s, state, why}
+```
+
+| |offset| | state | consequence |
+| --- | --- | --- |
+| ≤ 5s | `ok` | ordering by time is safe |
+| 5–60s | `note` | ordering is inexact, not wrong |
+| > 60s | `skewed` | **a transcript sorted by time is wrong** — sort by receipt order |
+
+Positive offset = their clock is **behind** ours; negative = **ahead**. The words say
+which, because a bare signed number gets read backwards exactly once per reviewer.
+
+`doctor` prints one `clock` line naming the worst peer — and **nothing at all** when no
+peer has ever sent a timestamp. "No samples" is reported as `unknown`, never as "in
+sync": a peer on a build older than the timestamp field is indistinguishable from one
+whose clock matches ours, and those are different claims.
+
 ## Verification
 
 ```bash
 python3 tools/test_wire.py   # 6 checks: framing, signing, allowlist, tamper, replay
+python3 tools/test_timestamp.py # sender-attested ts: stored, tamper drops, old sender fine
+python3 tools/test_skew.py # clock skew: min-filter, sign, thresholds, silence when unknown
 bun tools/test_watch.ts      # 8 checks: delivery, dedupe, mute, header shape
 bun tools/test_race.ts       # 3 checks: two sessions, one inbox, exactly once
 bun tools/test_firstrun.ts   # first install must not swallow new mail
@@ -567,6 +602,16 @@ checks the fingerprint against `peers.json`, and writes the message to
 **claims** each new message atomically (a `state/claimed/<id>` file created with
 `O_EXCL`, so two pi sessions on one machine cannot both deliver it), and injects
 it as a user turn. Server, relay, account, and identity provider: none.
+
+Every send also carries a **sender timestamp** — `ts` (the sender's clock in
+integer milliseconds) plus `tsig`, a signature over `nonce || "toragents-ts1" || ts`
+with the same key that signed the body. The receiver verifies it and stores
+`sent_at` beside its own `received`. Both are facts, not a verdict: `received` is
+our clock, `sent_at` is theirs, and the difference is transit time plus clock
+skew, which one message cannot split apart. A missing or bad `tsig` drops the
+timestamp and never the message — a clock is not a credential. Old senders that
+omit `ts` and old receivers that ignore it are both still fine: the field is an
+optional, forward-compatible envelope key, exactly like the digest.
 
 ## License
 

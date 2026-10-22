@@ -464,6 +464,25 @@ class Inbox:
                         "error": f"addressed to {target_session}, no live session on this box",
                         "live_sessions": sorted(k for k, v in live.items() if v)}
 
+        # Sender-attested timestamp (see send_to): the peer's clock at send,
+        # signed separately so an old receiver ignores it and a new one can store
+        # both clocks. A bad or absent signature drops the timestamp, never the
+        # message. `received` is OUR clock, `sent_at` is theirs; the difference is
+        # transit time plus clock skew, which one message cannot split apart -- so
+        # it is stored as two facts, not as a verdict about which clock is right.
+        sent_at = None
+        if "ts" in req:
+            try:
+                ts = int(req["ts"])
+                if not isinstance(req.get("tsig"), str):
+                    raise ValueError("tsig missing or not a string")
+                if sender.verify(nonce + b"toragents-ts1" + ts_canon(ts), b64d(req["tsig"])):
+                    sent_at = ts / 1000.0
+                else:
+                    print("[inbox] ts dropped: signature does not verify", flush=True)
+            except (ValueError, TypeError, binascii.Error) as e:
+                print(f"[inbox] ts dropped: {e}", flush=True)
+
         mid = uuid.uuid4().hex[:12]
         rec = {"id": mid, "received": time.time(), "from_fingerprint": fp,
                "from_label": peer.get("label", ""), "from_onion": peer.get("onion", ""),
@@ -473,6 +492,8 @@ class Inbox:
                # this got in" -- and those are very different questions to answer.
                "from_known": True,
                "body": body}
+        if sent_at is not None:
+            rec["sent_at"] = sent_at
         for f in ("from_session", "to_session"):
             if f == "to_session" and presence:
                 # Unverified address: store the fact, not the address. Keeping it
@@ -694,6 +715,17 @@ def send_to(target_onion, body, k=None, session=None, to_session=None,
             payload["dsig"] = b64e(k.sign(nonce + b"toragents-dg1" + dg_canon(dgp)))
         except Exception as e:
             print(f"[send] WARNING no digest attached: {e}", file=sys.stderr)
+        # Sender timestamp, signed like the digest so an old receiver ignores the
+        # keys and a new one can compare two clocks. Integer milliseconds (not a
+        # float) because a float's repr is a display choice, not a wire format.
+        # A failure to attach must never cost the send -- it is a clock, not a
+        # credential.
+        try:
+            ts = int(time.time() * 1000)
+            payload["ts"] = ts
+            payload["tsig"] = b64e(k.sign(nonce + b"toragents-ts1" + ts_canon(ts)))
+        except Exception as e:
+            print(f"[send] WARNING no timestamp attached: {e}", file=sys.stderr)
         send_msg(sock, payload)
         return recv_msg(sock)
     finally:
@@ -1076,6 +1108,25 @@ def cmd_doctor(a):
     owner = _ownership_note(STATE)
     if owner:
         findings.append({"sev": "note", "text": owner})
+
+    # Clock skew, if any peer has ever sent a signed timestamp. Note severity: a
+    # peer's clock is a fact about their machine, not about whether ours is running
+    # the code on disk. Silent when there is nothing to say, like every other note.
+    try:
+        skew = {fp: e for fp, e in clock_report(STATE).items()
+                if e.get("offset_s") is not None}
+    except OSError:
+        skew = {}
+    if skew:
+        worst_fp, worst = max(skew.items(), key=lambda kv: abs(kv[1]["offset_s"]))
+        try:
+            name = (peers().get(worst_fp) or {}).get("label") or worst_fp[:12]
+        except Exception:
+            name = worst_fp[:12]
+        findings.append({"sev": "note",
+                         "text": f"clock        {name} {worst['offset_s']:+.1f}s "
+                                 f"from ours (min of {worst['n']} samples, "
+                                 f"spread {worst['spread_s']:.1f}s) -- {worst['why']}"})
 
     # NOTE severity, deliberately: these are facts about DATA, not about running code.
     # The exit code answers "is the running system consistent with the disk"; a test
@@ -1674,6 +1725,134 @@ def cmd_peers(a):
               + (f"\n{'':18} tone: {tone}" if tone else ""))
 
 
+# ------------------------------------------------------------- clock skew --
+#
+# Every message now carries two clocks: `received` (ours) and `sent_at` (the peer's,
+# from PR #1). Their difference is transit time PLUS clock skew, and one message
+# cannot split those apart -- so this does not try. It uses the only honest estimator
+# available: the MINIMUM across samples.
+#
+# Transit is non-negative, so the smallest observed difference is the sample least
+# polluted by network time. It is a lower bound on the real offset: skew = min(delta)
+# understates by the true transit of the fastest message. That is stated in the
+# output rather than corrected for, because inventing a transit estimate would be the
+# same class of lie as a bare timestamp with no date.
+#
+# Why it matters at all: skew reorders history. A peer 90 seconds fast makes its
+# messages look newer than they are, and a reader sorting a transcript by time gets
+# a story nobody told. Having the number means the reader can say so.
+
+CLOCK_SAMPLES = 200          # newest N messages carrying a signed sent_at
+CLOCK_OK_S = 5.0             # within this, ordering is safe
+CLOCK_WARN_S = 60.0          # beyond this, a transcript sorted by time is wrong
+
+
+def clock_samples(state_dir, limit=CLOCK_SAMPLES):
+    """Per-peer list of (received - sent_at) deltas, newest first, capped."""
+    out = {}
+    d = os.path.join(state_dir, "inbox")
+    if not os.path.isdir(d):
+        return out
+    rows = []
+    for name in os.listdir(d):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, name)) as f:
+                r = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(r.get("sent_at"), (int, float)):
+            continue
+        if not isinstance(r.get("received"), (int, float)):
+            continue
+        rows.append(r)
+    rows.sort(key=lambda r: r.get("received") or 0)
+    for r in rows[-limit:]:
+        fp = r.get("from_fingerprint") or "?"
+        out.setdefault(fp, []).append(float(r["received"]) - float(r["sent_at"]))
+    return out
+
+
+def clock_estimate(deltas):
+    """{n, offset_s, spread_s, state, why} from a list of deltas.
+
+    Positive offset = their clock is BEHIND ours (their stamp is older than the
+    moment we received it). Negative = they are AHEAD. The sign is stated in `why`
+    because a bare number gets read backwards exactly once per reviewer.
+    """
+    if not deltas:
+        return {"n": 0, "offset_s": None, "spread_s": None, "state": "unknown",
+                "why": "no message carried a signed sender timestamp; an older peer "
+                       "is indistinguishable from a silent one here"}
+    lo = min(deltas)
+    ordered = sorted(deltas)
+    med = ordered[len(ordered) // 2]
+    spread = med - lo
+    ahead = -lo
+    if abs(lo) <= CLOCK_OK_S:
+        state, why = "ok", f"within {CLOCK_OK_S:.0f}s; ordering is safe"
+    elif abs(lo) <= CLOCK_WARN_S:
+        state = "note"
+        why = (f"their clock is {'ahead of' if ahead > 0 else 'behind'} ours by about "
+               f"{abs(ahead):.0f}s -- ordering by time is inexact, not wrong")
+    else:
+        state = "skewed"
+        why = (f"their clock is {'ahead of' if ahead > 0 else 'behind'} ours by about "
+               f"{abs(ahead):.0f}s -- a transcript sorted by time is wrong; sort by "
+               f"receipt order instead")
+    return {"n": len(deltas), "offset_s": round(lo, 3), "spread_s": round(spread, 3),
+            "state": state, "why": why}
+
+
+def clock_report(state_dir):
+    """Per-peer estimates, plus a one-line summary for doctor."""
+    samples = clock_samples(state_dir)
+    out = {}
+    for fp, deltas in samples.items():
+        out[fp] = clock_estimate(deltas)
+    return out
+
+
+def cmd_clock(a):
+    """How far apart are the two clocks? Estimated, not assumed."""
+    report = clock_report(STATE)
+    try:
+        labels = {fp: (v.get("label") or fp[:12]) for fp, v in peers().items()}
+    except Exception:
+        labels = {}
+    if not report:
+        doc = {"v": 1, "peers": {}, "state": "unknown"}
+        if getattr(a, "json", False):
+            print(json.dumps(doc, indent=2))
+        else:
+            print("clock: no signed sender timestamps yet -- cannot estimate skew")
+            print("  a peer on a build older than the timestamp field looks exactly like")
+            print("  this, so 'unknown' is the answer, not 'in sync'")
+        sys.exit(2)
+    if getattr(a, "json", False):
+        print(json.dumps({"v": 1, "peers": {
+            labels.get(fp, fp[:12]): est for fp, est in report.items()}}, indent=2))
+        worst = min((e["offset_s"] for e in report.values()
+                     if e["offset_s"] is not None), default=None, key=abs)
+        sys.exit(0 if worst is not None and abs(worst) <= CLOCK_WARN_S else 2)
+    worst = None
+    for fp, est in sorted(report.items(), key=lambda kv: kv[0]):
+        name = labels.get(fp, fp[:12])
+        if est["offset_s"] is None:
+            print(f"{name:16} unknown    {est['why']}")
+            continue
+        print(f"{name:16} {est['offset_s']:+8.1f}s  n={est['n']:<4} "
+              f"spread={est['spread_s']:.1f}s  {est['state']}")
+        print(f"{'':16} {est['why']}")
+        if worst is None or abs(est["offset_s"]) > abs(worst):
+            worst = est["offset_s"]
+    print("\noffset = min(received - sent_at): transit is non-negative, so the smallest")
+    print("difference is the sample least polluted by network time. It is a LOWER BOUND")
+    print("on their skew, not a measurement of it. spread = median - min.")
+    sys.exit(0 if worst is not None and abs(worst) <= CLOCK_WARN_S else 2)
+
+
 def _msgs(include_archived=False):
     out = []
     for d, arch in ((INBOX, False), (ARCHIVE, True)):
@@ -1797,6 +1976,13 @@ DG_STATES = ("delivered-both", "accepted-only", "never-stored", "mismatch", "sta
 DG_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,64}$")
 DG_H_RE = re.compile(r"^[0-9a-f]{32}$")
 DG_TOP_KEYS = {"v", "gen", "a", "b", "dsig"}
+
+
+def ts_canon(ts):
+    """Integer milliseconds as the bytes a sender signs: an int's str() is a
+    wire format; a float's repr() is a display choice. Both sides share it, so
+    a timestamp signature means exactly one thing."""
+    return str(int(ts)).encode("ascii")
 
 
 def dg_canon(d):
@@ -2384,6 +2570,10 @@ def main():
     p = s.add_parser("ack")
     p.add_argument("id")
     p.set_defaults(fn=cmd_ack)
+    p = s.add_parser("clock")
+    p.add_argument("--json", action="store_true",
+                   help="per-peer {n, offset_s, spread_s, state, why}")
+    p.set_defaults(fn=cmd_clock)
     p = s.add_parser("reach")
     p.add_argument("--to", default="")
     p.set_defaults(fn=cmd_reach)
