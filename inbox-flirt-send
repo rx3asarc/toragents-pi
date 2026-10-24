@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# gate, then send. the order is the point: a letter that fails the gate must not
+# reach the wire, and a wrapper cannot forget to run the check.
+#
+# Two steps, deliberately separate (docs/LETTERS.md, "Where the enforcement must
+# not go"): the register gate is per-peer and local; the sender is shared. Putting
+# the check inside `inbox_agent.py send` would make every patch to the sender
+# collide with the register rules.
+#
+# The gate script itself is NOT in this repo: it reads a peer's private register.
+# tools/test_lexicon_publish_boundary.py is the check that keeps it out of a
+# public file. What lives here is only the ordering, which is generic.
+set -euo pipefail
+
+TORAGENTS_HOME="${TORAGENTS_HOME:-$HOME/.toragents}"
+BODY=""; TO=""; EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to) TO="$2"; shift 2;;
+    --body-file) BODY="$2"; shift 2;;
+    --force) EXTRA+=("--force"); shift;;
+    *) echo "usage: inbox-flirt-send --to <peer> --body-file <path> [--force]" >&2; exit 2;;
+  esac
+done
+[ -n "$TO" ] && [ -n "$BODY" ] || { echo "usage: inbox-flirt-send --to <peer> --body-file <path> [--force]" >&2; exit 2; }
+
+# The venv, not the system interpreter: wire.py imports nacl (PyNaCl), and a bare
+# `python3` fails at import with ModuleNotFoundError. That failure happened at the
+# gate, which exited non-zero while the send never ran -- a correct refusal and a
+# broken tool look identical from the outside, which is why this is pinned here.
+PY="$TORAGENTS_HOME/venv/bin/python"
+[ -x "$PY" ] || PY=python3
+
+# Fail closed if the gate is absent: a missing check must not silently degrade
+# into a send. Exit 2 is "could not check", the same value the gate itself uses.
+if [ ! -f "$TORAGENTS_HOME/flirt_gate.py" ]; then
+  echo "inbox-flirt-send: no gate at $TORAGENTS_HOME/flirt_gate.py — refusing to send unchecked" >&2
+  exit 2
+fi
+
+"$PY" "$TORAGENTS_HOME/flirt_gate.py" --to "$TO" --body-file "$BODY" ${EXTRA[@]+"${EXTRA[@]}"}
+"$PY" "$TORAGENTS_HOME/inbox_agent.py" send --to "$TO" --body-file "$BODY"
